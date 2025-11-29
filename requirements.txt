@@ -1,7 +1,8 @@
-onnxruntime
+
 onnxruntime-gpu
 matplotlib
 numpy
 tqdm
 torchvision
+opencv-python-headless
 av

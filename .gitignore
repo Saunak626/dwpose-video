@@ -6,3 +6,8 @@
 *.webm
 *.mkv
 *.onnx
+*.pyc
+*.pth
+*.avi
+
+/tmp
