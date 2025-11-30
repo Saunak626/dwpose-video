@@ -50,7 +50,7 @@ def preprocess(
 
 
 def inference(sess: ort.InferenceSession, img: np.ndarray) -> np.ndarray:
-    """Inference RTMPose model.
+    """Inference RTMPose model (逐个推理，兼容旧接口).
 
     Args:
         sess (ort.InferenceSession): ONNXRuntime session.
@@ -77,13 +77,38 @@ def inference(sess: ort.InferenceSession, img: np.ndarray) -> np.ndarray:
     return all_out
 
 
+def inference_batch(sess: ort.InferenceSession, imgs: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """批量推理 RTMPose 模型（利用动态 batch 支持）.
+
+    Args:
+        sess (ort.InferenceSession): ONNXRuntime session.
+        imgs (List[np.ndarray]): 预处理后的图像列表，每个 shape 为 (H, W, 3).
+
+    Returns:
+        tuple: (simcc_x, simcc_y) 批量输出
+    """
+    if len(imgs) == 0:
+        return np.array([]), np.array([])
+
+    # 合并为 batch: (N, 3, H, W)
+    batch_input = np.stack([img.transpose(2, 0, 1) for img in imgs], axis=0).astype(np.float32)
+
+    # 单次推理
+    sess_input = {sess.get_inputs()[0].name: batch_input}
+    sess_output = [out.name for out in sess.get_outputs()]
+    outputs = sess.run(sess_output, sess_input)
+
+    # outputs: [simcc_x (N, K, Wx), simcc_y (N, K, Wy)]
+    return outputs[0], outputs[1]
+
+
 def postprocess(outputs: List[np.ndarray],
                 model_input_size: Tuple[int, int],
                 center: Tuple[int, int],
                 scale: Tuple[int, int],
                 simcc_split_ratio: float = 2.0
                 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Postprocess for RTMPose model output.
+    """Postprocess for RTMPose model output (逐个后处理，兼容旧接口).
 
     Args:
         outputs (np.ndarray): Output of RTMPose model.
@@ -110,6 +135,45 @@ def postprocess(outputs: List[np.ndarray],
         all_score.append(scores[0])
 
     return np.array(all_key), np.array(all_score)
+
+
+def postprocess_batch(simcc_x: np.ndarray, simcc_y: np.ndarray,
+                      model_input_size: Tuple[int, int],
+                      centers: List[np.ndarray],
+                      scales: List[np.ndarray],
+                      simcc_split_ratio: float = 2.0
+                      ) -> Tuple[np.ndarray, np.ndarray]:
+    """批量后处理 RTMPose 模型输出.
+
+    Args:
+        simcc_x (np.ndarray): x 方向 SimCC，shape (N, K, Wx).
+        simcc_y (np.ndarray): y 方向 SimCC，shape (N, K, Wy).
+        model_input_size (tuple): 模型输入尺寸 (w, h).
+        centers (List[np.ndarray]): 各 bbox 中心坐标列表.
+        scales (List[np.ndarray]): 各 bbox 缩放因子列表.
+        simcc_split_ratio (float): SimCC 分割比例.
+
+    Returns:
+        tuple:
+        - keypoints (np.ndarray): 关键点坐标 (N, K, 2).
+        - scores (np.ndarray): 关键点置信度 (N, K).
+    """
+    if len(simcc_x) == 0:
+        return np.array([]), np.array([])
+
+    # 批量解码
+    keypoints, scores = decode(simcc_x, simcc_y, simcc_split_ratio)
+    # keypoints: (N, K, 2), scores: (N, K)
+
+    # 批量坐标转换
+    centers = np.array(centers)  # (N, 2)
+    scales = np.array(scales)    # (N, 2)
+
+    # 广播计算: keypoints / model_input_size * scale + center - scale / 2
+    model_size = np.array(model_input_size)  # (2,)
+    keypoints = keypoints / model_size * scales[:, None, :] + centers[:, None, :] - scales[:, None, :] / 2
+
+    return keypoints, scores
 
 
 def bbox_xyxy2cs(bbox: np.ndarray,
