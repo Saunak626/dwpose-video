@@ -37,11 +37,18 @@ from annotator.dwpose import DWposeDetector
 
 class DWposeDetectorBatch(DWposeDetector):
     """支持批量推理的 DWPose 检测器"""
-    
-    def __init__(self):
+
+    def __init__(self, use_dynamic_det: bool = False):
         super().__init__()
-        print("🚀 初始化 DWPose 检测器（批量推理模式）...")
-        
+        self.use_dynamic_det = use_dynamic_det
+
+        mode_str = "动态batch检测" if use_dynamic_det else "标准检测"
+        print(f"🚀 初始化 DWPose 检测器（{mode_str} + 批量姿态推理）...")
+
+        # 重新初始化 Wholebody 以使用正确的检测模型
+        from annotator.dwpose.wholebody import Wholebody
+        self.pose_estimation = Wholebody(use_dynamic_det=use_dynamic_det)
+
         # 检查 GPU 是否可用
         try:
             import onnxruntime as ort
@@ -174,7 +181,7 @@ class DWposeDetectorBatch(DWposeDetector):
 
 class BatchVideoProcessorUltra:
     """超级优化的批量视频处理器"""
-    
+
     def __init__(
         self,
         input_dir: str,
@@ -184,7 +191,8 @@ class BatchVideoProcessorUltra:
         skip_frames: int = 1,
         save_video: bool = True,
         save_format: str = 'npz',
-        skip_existing: bool = False
+        skip_existing: bool = False,
+        use_dynamic_det: bool = False
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -194,18 +202,19 @@ class BatchVideoProcessorUltra:
         self.save_video = save_video
         self.save_format = save_format
         self.skip_existing = skip_existing
-        
+        self.use_dynamic_det = use_dynamic_det
+
         # 创建输出目录
         self.video_output_dir = self.output_dir / 'video_output'
         self.keypoints_output_dir = self.output_dir / 'keypoints_output'
-        
+
         if self.save_video:
             self.video_output_dir.mkdir(parents=True, exist_ok=True)
         self.keypoints_output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 初始化检测器
-        self.detector = DWposeDetectorBatch()
-        
+        self.detector = DWposeDetectorBatch(use_dynamic_det=use_dynamic_det)
+
         print(f"\n📊 配置信息:")
         print(f"  - 批量大小: {self.batch_size}")
         print(f"  - 分辨率缩放: {self.scale_factor:.2f}x")
@@ -213,6 +222,7 @@ class BatchVideoProcessorUltra:
         print(f"  - 保存视频: {self.save_video}")
         print(f"  - 保存格式: {self.save_format}")
         print(f"  - 跳过已存在: {self.skip_existing}")
+        print(f"  - 动态batch检测: {use_dynamic_det}")
     
     def find_all_videos(self) -> List[Path]:
         """递归查找所有视频文件"""
@@ -510,10 +520,10 @@ class BatchVideoProcessorUltra:
         print("=" * 80)
 
 
-def _worker_init():
+def _worker_init(use_dynamic_det: bool = False):
     """多进程 worker 初始化函数：每个进程初始化自己的检测器"""
     global _worker_detector
-    _worker_detector = DWposeDetectorBatch()
+    _worker_detector = DWposeDetectorBatch(use_dynamic_det=use_dynamic_det)
 
 
 def _worker_process_video(video_info: Dict, config: Dict) -> Dict:
@@ -685,10 +695,12 @@ def process_videos_multiprocess(videos: List[Path], input_dir: Path, config: Dic
     Args:
         videos: 视频文件路径列表
         input_dir: 输入根目录
-        config: 处理配置
+        config: 处理配置（包含 use_dynamic_det）
         num_workers: 进程数
     """
-    print(f"\n🚀 启动 {num_workers} 个并行进程处理 {len(videos)} 个视频...")
+    use_dynamic_det = config.get('use_dynamic_det', False)
+    mode_str = "动态batch检测" if use_dynamic_det else "标准检测"
+    print(f"\n🚀 启动 {num_workers} 个并行进程处理 {len(videos)} 个视频（{mode_str}）...")
 
     # 准备任务列表
     video_infos = [{'video_path': str(v), 'input_dir': str(input_dir)} for v in videos]
@@ -700,8 +712,9 @@ def process_videos_multiprocess(videos: List[Path], input_dir: Path, config: Dic
     total_frames = 0
     total_time = 0
 
-    # 使用进程池
-    with mp.Pool(processes=num_workers, initializer=_worker_init) as pool:
+    # 使用进程池（传递 use_dynamic_det 给 worker 初始化函数）
+    init_fn = partial(_worker_init, use_dynamic_det=use_dynamic_det)
+    with mp.Pool(processes=num_workers, initializer=init_fn) as pool:
         worker_fn = partial(_worker_process_video, config=config)
 
         # 使用 imap_unordered 获取结果并显示进度
@@ -812,6 +825,8 @@ def main():
     parser.add_argument('--skip-existing', action='store_true', help='跳过已处理的文件')
     parser.add_argument('--num-workers', type=int, default=1,
                         help='并行进程数（默认: 1，单进程）。注意：多进程模式下每个进程都会加载模型，需要更多显存')
+    parser.add_argument('--use-dynamic-det', action='store_true',
+                        help='使用动态 batch 检测模型（需要 models/yolox_l_dynamic.onnx）')
 
     args = parser.parse_args()
 
@@ -843,7 +858,8 @@ def main():
             skip_frames=args.skip_frames,
             save_video=not args.no_video,
             save_format=args.format,
-            skip_existing=args.skip_existing
+            skip_existing=args.skip_existing,
+            use_dynamic_det=args.use_dynamic_det
         )
         processor.process_all_videos()
     else:
@@ -872,7 +888,8 @@ def main():
             'skip_frames': args.skip_frames,
             'save_video': not args.no_video,
             'save_format': args.format,
-            'skip_existing': args.skip_existing
+            'skip_existing': args.skip_existing,
+            'use_dynamic_det': args.use_dynamic_det
         }
 
         process_videos_multiprocess(videos, input_dir, config, args.num_workers)

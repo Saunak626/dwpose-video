@@ -3,16 +3,28 @@ import numpy as np
 from typing import List, Tuple
 
 import onnxruntime as ort
-from .onnxdet import inference_detector
+from .onnxdet import inference_detector, inference_detector_batch
 from .onnxpose import inference_pose, preprocess, inference_batch, postprocess_batch
 
+
 class Wholebody:
-    def __init__(self):
+    def __init__(self, use_dynamic_det: bool = False):
+        """初始化 Wholebody 检测器
+
+        Args:
+            use_dynamic_det: 是否使用动态 batch 检测模型（需要 yolox_l_dynamic.onnx）
+        """
         device = 'cuda:0'
-        providers = ['CPUExecutionProvider'
-                 ] if device == 'cpu' else ['CUDAExecutionProvider']
-        onnx_det = 'models/yolox_l.onnx'
+        providers = ['CPUExecutionProvider'] if device == 'cpu' else ['CUDAExecutionProvider']
+
+        # 选择检测模型
+        if use_dynamic_det:
+            onnx_det = 'models/yolox_l_dynamic.onnx'
+        else:
+            onnx_det = 'models/yolox_l.onnx'
         onnx_pose = 'models/dw-ll_ucoco_384.onnx'
+
+        self.use_dynamic_det = use_dynamic_det
 
         self.session_det = ort.InferenceSession(path_or_bytes=onnx_det, providers=providers)
         self.session_pose = ort.InferenceSession(path_or_bytes=onnx_pose, providers=providers)
@@ -62,8 +74,7 @@ class Wholebody:
     def batch_inference(self, images: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray]]:
         """批量推理多帧图像.
 
-        利用姿态模型的动态 batch 支持，合并多帧中检测到的所有人进行批量推理。
-        检测模型仍需逐帧执行（模型限制）。
+        利用检测和姿态模型的动态 batch 支持，实现真正的批量推理。
 
         Args:
             images: 图像列表，每个 shape 为 (H, W, 3)
@@ -74,11 +85,16 @@ class Wholebody:
         if len(images) == 0:
             return []
 
-        # 阶段1：逐帧检测（检测模型不支持 batch）
-        all_bboxes = []
-        for img in images:
-            bboxes = inference_detector(self.session_det, img)
-            all_bboxes.append(bboxes)
+        # 阶段1：检测（支持批量或逐帧）
+        if self.use_dynamic_det:
+            # 批量检测（动态 batch 模型）
+            all_bboxes = inference_detector_batch(self.session_det, images)
+        else:
+            # 逐帧检测（固定 batch=1 模型）
+            all_bboxes = []
+            for img in images:
+                bboxes = inference_detector(self.session_det, img)
+                all_bboxes.append(bboxes)
 
         # 阶段2：收集所有人的 crops 和元信息
         all_crops = []
