@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from pathlib import Path
 from typing import List, Tuple
 
 import onnxruntime as ort
@@ -7,27 +8,74 @@ from .onnxdet import inference_detector, inference_detector_batch
 from .onnxpose import inference_pose, preprocess, inference_batch, postprocess_batch
 
 
+def _select_providers(device: str) -> List[str]:
+    """根据设备参数选择 ONNX Runtime provider 列表。"""
+    normalized = device.lower()
+    if normalized == 'gpu':
+        normalized = 'cuda'
+
+    if normalized == 'cpu':
+        return ['CPUExecutionProvider']
+
+    if normalized not in {'auto', 'cuda'}:
+        raise ValueError(f"device 只能是 auto/cuda/cpu，当前为: {device}")
+
+    available = ort.get_available_providers()
+    if 'CUDAExecutionProvider' in available:
+        return ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+    if normalized == 'cuda':
+        raise RuntimeError(
+            f"请求使用 CUDAExecutionProvider，但当前可用 providers 为: {available}"
+        )
+
+    return ['CPUExecutionProvider']
+
+
 class Wholebody:
-    def __init__(self, use_dynamic_det: bool = False):
+    def __init__(
+        self,
+        use_dynamic_det: bool = False,
+        model_dir: str = 'models',
+        device: str = 'auto'
+    ):
         """初始化 Wholebody 检测器
 
         Args:
             use_dynamic_det: 是否使用动态 batch 检测模型（需要 yolox_l_dynamic.onnx）
+            model_dir: DWPose ONNX 模型目录
+            device: 推理设备，支持 auto/cuda/cpu
         """
-        device = 'cuda:0'
-        providers = ['CPUExecutionProvider'] if device == 'cpu' else ['CUDAExecutionProvider']
+        providers = _select_providers(device)
+        model_root = Path(model_dir)
 
         # 选择检测模型
         if use_dynamic_det:
-            onnx_det = 'models/yolox_l_dynamic.onnx'
+            onnx_det = model_root / 'yolox_l_dynamic.onnx'
         else:
-            onnx_det = 'models/yolox_l.onnx'
-        onnx_pose = 'models/dw-ll_ucoco_384.onnx'
+            onnx_det = model_root / 'yolox_l.onnx'
+        onnx_pose = model_root / 'dw-ll_ucoco_384.onnx'
 
         self.use_dynamic_det = use_dynamic_det
+        self.model_dir = str(model_root)
+        self.device = device
+        self.requested_providers = providers
+        self.det_model_path = str(onnx_det)
+        self.pose_model_path = str(onnx_pose)
 
-        self.session_det = ort.InferenceSession(path_or_bytes=onnx_det, providers=providers)
-        self.session_pose = ort.InferenceSession(path_or_bytes=onnx_pose, providers=providers)
+        self.session_det = ort.InferenceSession(path_or_bytes=str(onnx_det), providers=providers)
+        self.session_pose = ort.InferenceSession(path_or_bytes=str(onnx_pose), providers=providers)
+
+        self.det_providers = self.session_det.get_providers()
+        self.pose_providers = self.session_pose.get_providers()
+        if device.lower() in {'cuda', 'gpu'} and (
+            'CUDAExecutionProvider' not in self.det_providers
+            or 'CUDAExecutionProvider' not in self.pose_providers
+        ):
+            raise RuntimeError(
+                "请求使用 CUDAExecutionProvider，但模型 session 未实际启用 CUDA。"
+                f" det_providers={self.det_providers}, pose_providers={self.pose_providers}"
+            )
 
         # 获取姿态模型输入尺寸
         h, w = self.session_pose.get_inputs()[0].shape[2:]
@@ -146,5 +194,4 @@ class Wholebody:
             results.append((keypoints, scores))
 
         return results
-
 
